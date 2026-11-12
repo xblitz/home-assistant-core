@@ -853,6 +853,69 @@ async def websocket_unbind_devices(
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
+        probatio.Required(TYPE): "zha/devices/bindings",
+        probatio.Required(ATTR_IEEE): IEEE_SCHEMA,
+    }
+)
+@websocket_api.async_response
+async def websocket_get_device_bindings(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Get the bindings stored in a device's binding table."""
+    zha_gateway = get_zha_gateway(hass)
+    ieee: EUI64 = msg[ATTR_IEEE]
+    if (
+        zha_device := _async_get_zigbee_device(zha_gateway, connection, msg[ID], ieee)
+    ) is None:
+        return
+
+    clusters_by_endpoint = zha_device.async_get_clusters()
+    zdo = zha_device.device.zdo
+
+    bindings: list[dict[str, Any]] = []
+    start_index = 0
+    while True:
+        status, total_entries, page_start_index, entries = await zdo.request(
+            zdo_types.ZDOCmd.Mgmt_Bind_req, start_index
+        )
+        if status != zdo_types.Status.SUCCESS:
+            connection.send_error(
+                msg[ID],
+                websocket_api.ERR_NOT_SUPPORTED,
+                f"Device {ieee} could not return its binding table: {status.name}",
+            )
+            return
+
+        for entry in entries:
+            binding: dict[str, Any] = {
+                "source_endpoint": entry.SrcEndpoint,
+                "cluster_id": entry.ClusterId,
+                "cluster_name": None,
+            }
+            out_clusters = clusters_by_endpoint.get(entry.SrcEndpoint, {}).get(
+                CLUSTER_TYPE_OUT, {}
+            )
+            if (cluster := out_clusters.get(entry.ClusterId)) is not None:
+                binding["cluster_name"] = cluster.__class__.__name__
+
+            dst_address = entry.DstAddress
+            if dst_address.addrmode == 1:
+                binding["group_id"] = dst_address.nwk
+            else:
+                binding["target_ieee"] = str(dst_address.ieee)
+                binding["target_endpoint"] = dst_address.endpoint
+            bindings.append(binding)
+
+        start_index = page_start_index + len(entries)
+        if not entries or start_index >= total_entries:
+            break
+
+    connection.send_result(msg[ID], bindings)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
         probatio.Required(TYPE): "zha/groups/bind",
         probatio.Required(ATTR_SOURCE_IEEE): IEEE_SCHEMA,
         probatio.Required(GROUP_ID): cv.positive_int,
@@ -1203,6 +1266,7 @@ def async_load_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_get_bindable_devices)
     websocket_api.async_register_command(hass, websocket_bind_devices)
     websocket_api.async_register_command(hass, websocket_unbind_devices)
+    websocket_api.async_register_command(hass, websocket_get_device_bindings)
     websocket_api.async_register_command(hass, websocket_update_topology)
     websocket_api.async_register_command(hass, websocket_get_configuration)
     websocket_api.async_register_command(hass, websocket_update_zha_configuration)
